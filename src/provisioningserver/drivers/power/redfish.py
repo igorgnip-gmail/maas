@@ -213,17 +213,22 @@ class RedfishPowerDriverBase(PowerDriver):
 
             def cb_json_decode(data):
                 data = data.decode("utf-8")
-                # Only decode non-empty response bodies.
-                if data:
-                    # occasionally invalid json is returned. provide a clear
-                    # error in that case
-                    try:
-                        return json.loads(data)
-                    except ValueError as error:
-                        raise PowerActionError(  # noqa: B904
-                            "Redfish request failed from a JSON parse error:"
-                            " %s." % error
-                        )
+                # An empty body is a valid response for some requests (e.g.
+                # POST power actions), and BMCs occasionally send one where a
+                # body would normally be expected. Return an empty dict
+                # rather than None so callers can safely call .get() on the
+                # result instead of needing a None-check at every call site.
+                if not data:
+                    return {}
+                # occasionally invalid json is returned. provide a clear
+                # error in that case
+                try:
+                    return json.loads(data)
+                except ValueError as error:
+                    raise PowerActionError(  # noqa: B904
+                        "Redfish request failed from a JSON parse error:"
+                        " %s." % error
+                    )
 
             def cb_attach_headers(data, headers):
                 return data, headers
@@ -334,6 +339,10 @@ class RedfishPowerDriver(RedfishPowerDriverBase):
         uri = join(url, REDFISH_SYSTEMS_ENDPOINT)
         systems, _ = yield self.redfish_request(b"GET", uri, headers)
         members = systems.get("Members")
+        if not members:
+            raise PowerActionError(
+                "Redfish request for Systems returned no Members."
+            )
         # remove trailing slashes. basename('...Systems/1/) = ''
         member = members[0].get("@odata.id").rstrip("/")
         return basename(member).encode("utf-8")
