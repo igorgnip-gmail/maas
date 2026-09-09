@@ -400,14 +400,16 @@ class IPMIPowerDriver(PowerDriver):
         k_g=None,
         cipher_suite_id=None,
         privilege_level=None,
-        workaround_flags=["opensesspriv"],
-        **extra
+        workaround_flags=None,
+        **extra,
     ):
         """Issue command to ipmipower, for the given system."""
         # This script deliberately does not check the current power state
         # before issuing the requested power command. See bug 1171418 for an
         # explanation.
 
+        if workaround_flags is None:
+            workaround_flags = ["opensesspriv"]
         if is_power_parameter_set(mac_address) and not is_power_parameter_set(
             power_address
         ):
