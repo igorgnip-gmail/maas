@@ -284,13 +284,19 @@ class RedfishPowerDriver(RedfishPowerDriverBase):
         return etag
 
     @inlineCallbacks
-    def get_node_id(self, url, headers):
+    def get_node_id(self, url, headers, retries=0):
         uri = join(url, REDFISH_SYSTEMS_ENDPOINT)
         systems, _ = yield self.redfish_request(b"GET", uri, headers)
         members = systems.get("Members")
         if not members:
-            raise PowerActionError(
-                "Redfish request for Systems returned no Members."
+            if retries == MAX_STATUS_REQUEST_RETRIES:
+                raise PowerActionError(
+                    "Redfish request for Systems returned no Members."
+                )
+            sleep_time = ((2**retries) - 1) / 2
+            yield pause(sleep_time)
+            return (
+                yield self.get_node_id(url, headers, retries + 1)
             )
         # remove trailing slashes. basename('...Systems/1/) = ''
         member = members[0].get("@odata.id").rstrip("/")
