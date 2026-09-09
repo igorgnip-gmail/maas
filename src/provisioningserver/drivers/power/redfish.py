@@ -28,7 +28,10 @@ from provisioningserver.drivers import (
 )
 from provisioningserver.drivers.power import PowerActionError, PowerDriver
 from provisioningserver.drivers.power.utils import WebClientContextFactory
-from provisioningserver.utils.twisted import asynchronous
+from provisioningserver.logger import get_maas_logger
+from provisioningserver.utils.twisted import asynchronous, pause
+
+maaslog = get_maas_logger("drivers.power.redfish")
 
 # no trailing slashes
 REDFISH_POWER_CONTROL_ENDPOINT = (
@@ -36,6 +39,8 @@ REDFISH_POWER_CONTROL_ENDPOINT = (
 )
 
 REDFISH_SYSTEMS_ENDPOINT = b"redfish/v1/Systems"
+
+MAX_STATUS_REQUEST_RETRIES = 7
 
 
 class RedfishPowerDriverBase(PowerDriver):
@@ -263,12 +268,18 @@ class RedfishPowerDriver(RedfishPowerDriverBase):
             b"POST", join(url, endpoint), headers, payload
         )
 
+        # Always wait for the BMC to transition to the desired status!
+        if power_change == "ForceOff":
+            yield self._wait_for_status("off", url, node_id, headers)
+        if power_change == "On":
+            yield self._wait_for_status("on", url, node_id, headers)
+
     @asynchronous
     @inlineCallbacks
     def power_on(self, node_id, context):
         """Power on machine."""
         url, node_id, headers = yield self.process_redfish_context(context)
-        power_state = yield self.power_query(node_id, context)
+        power_state = yield self._power_query(url, node_id, headers)
         # Power off the machine if currently on.
         if power_state == "on":
             yield self.power("ForceOff", url, node_id, headers)
@@ -282,8 +293,8 @@ class RedfishPowerDriver(RedfishPowerDriverBase):
     def power_off(self, node_id, context):
         """Power off machine."""
         url, node_id, headers = yield self.process_redfish_context(context)
-        # Power off the machine if it is not already off
-        power_state = yield self.power_query(node_id, context)
+        # Power off the machine if it is not already off and wait until the BMC confirms that.
+        power_state = yield self._power_query(url, node_id, headers)
         if power_state != "off":
             yield self.power("ForceOff", url, node_id, headers)
         # Set to PXE boot.
@@ -294,6 +305,62 @@ class RedfishPowerDriver(RedfishPowerDriverBase):
     def power_query(self, node_id, context):
         """Power query machine."""
         url, node_id, headers = yield self.process_redfish_context(context)
+        return (yield self._power_query(url, node_id, headers))
+
+    @asynchronous
+    @inlineCallbacks
+    def _power_query(self, url, node_id, headers, retries=0):
         uri = join(url, REDFISH_SYSTEMS_ENDPOINT, b"%s" % node_id)
         node_data, _ = yield self.redfish_request(b"GET", uri, headers)
-        return node_data.get("PowerState").lower()
+        node_power_state = node_data.get("PowerState", "Null")
+        if not node_power_state:
+            node_power_state = "Null"
+        node_power_state = node_power_state.lower()
+        if node_power_state in ("off", "poweringon"):
+            return "off"
+        elif node_power_state in ("on", "paused", "poweringoff"):
+            return "on"
+        elif node_power_state in ("reset", "unknown", "null"):
+            # Transitional statuses -- wait until we get a known one.
+            if retries == MAX_STATUS_REQUEST_RETRIES:
+                maaslog.error(
+                    "Redfish for the node %s is still in the %s status after all the retries. Giving up.",
+                    node_id,
+                    node_power_state,
+                )
+                return "error"
+
+            sleep_time = ((2**retries) - 1) / 2
+            maaslog.warning(
+                "Redfish for the node %s is in %s status. Retrying after %f seconds.",
+                node_id,
+                node_power_state,
+                sleep_time,
+            )
+            yield pause(sleep_time)
+            return (
+                yield self._power_query(url, node_id, headers, retries + 1)
+            )
+        else:
+            maaslog.error(
+                "Redfish returned the unexpected power state '%s' for the BMC card in node %s.",
+                node_power_state,
+                node_id,
+            )
+            return "error"
+
+    @inlineCallbacks
+    def _wait_for_status(self, desired_status, url, node_id, headers):
+        for waiting_time in self.wait_time:
+            current_status = yield self._power_query(url, node_id, headers)
+            if current_status == desired_status:
+                return
+            maaslog.debug(
+                f"Waiting for {node_id} to be {desired_status}. Current status is {current_status}."
+            )
+            yield pause(waiting_time)
+
+        raise PowerActionError(
+            f"The redfish node '{node_id.decode()}' did not transition to the state '{desired_status}'. The current status reported "
+            f"by the BMC is '{current_status}'."
+        )
